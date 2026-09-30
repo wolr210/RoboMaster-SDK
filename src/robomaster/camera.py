@@ -15,7 +15,11 @@
 
 
 import numpy
-import audioop
+try:
+    import audioop
+except ImportError:
+    # audioop was removed from the standard library in Python 3.13.
+    audioop = None
 import wave
 import time
 from . import module
@@ -30,6 +34,27 @@ __all__ = ['Camera', 'EPCamera', 'TelloCamera', 'STREAM_360P', 'STREAM_540P', 'S
 STREAM_360P = "360p"
 STREAM_540P = "540p"
 STREAM_720P = "720p"
+
+
+def _resample_s16(data, in_rate, out_rate):
+    """ 对单通道16位PCM音频重采样，audioop不可用时使用numpy线性插值
+
+    :param data: bytes: 输入的PCM字节流
+    :param in_rate: int: 输入采样率
+    :param out_rate: int: 输出采样率
+    :return: bytes: 重采样后的PCM字节流
+    """
+    if in_rate == out_rate or not data:
+        return data
+    if audioop is not None:
+        return audioop.ratecv(data, 2, 1, in_rate, out_rate, None)[0]
+    samples = numpy.frombuffer(data, dtype=numpy.int16)
+    out_len = int(len(samples) * out_rate / in_rate)
+    if out_len <= 0:
+        return b''
+    positions = numpy.arange(out_len) * (float(in_rate) / out_rate)
+    resampled = numpy.interp(positions, numpy.arange(len(samples)), samples)
+    return resampled.astype(numpy.int16).tobytes()
 
 
 class Camera(object):
@@ -373,8 +398,7 @@ class EPCamera(module.Module, Camera):
 
             if sample_rate != 48000:
                 data = b''.join(frames)
-                converted = audioop.ratecv(data, 2, 1, 48000, sample_rate, None)
-                wf.writeframes(converted[0])
+                wf.writeframes(_resample_s16(data, 48000, sample_rate))
             wf.close()
         except Exception as e:
             logger.error("Camera: record_audio, exception {0}".format(e))

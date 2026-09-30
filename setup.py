@@ -48,8 +48,14 @@ setup(
     install_requires=[
         'numpy >= 1.18',
         'opencv-python >= 4.2',
-        'netaddr >= 0.8',
-        'netifaces >= 0.10',
-        'myqr >= 2.3'
-    ]
+        'netaddr >= 0.8'
+    ],
+    extras_require={
+        # netifaces is unmaintained and has no wheels for current Python
+        # versions; it is only used to scan for Tello drones, and psutil or the
+        # standard library covers that. myqr is only used by
+        # examples/01_robot/05_sta_conn_helper.py.
+        'scan': ['psutil >= 5.9'],
+        'qrcode': ['myqr >= 2.3']
+    }
 )

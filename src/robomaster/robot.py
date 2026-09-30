@@ -16,7 +16,6 @@
 
 import os
 import threading
-import netifaces
 import socket
 import netaddr
 import time
@@ -423,6 +422,42 @@ class Drone(RobotBase):
         self._modules[_sensor.__class__.__name__] = _sensor
         self._modules[_led.__class__.__name__] = _led
 
+    @staticmethod
+    def _ipv4_interfaces():
+        """
+        Yield the (address, netmask) of every local IPv4 interface.
+
+        netifaces is unmaintained and has no wheels for current Python
+        versions, so fall back to psutil and then to the standard library,
+        which cannot report a netmask; /24 is assumed there, which is the only
+        netmask get_subnets() accepts anyway.
+        :return: iterator of (str, str)
+        """
+        try:
+            import netifaces
+        except ImportError:
+            pass
+        else:
+            for iface in netifaces.interfaces():
+                for ipinfo in netifaces.ifaddresses(iface).get(socket.AF_INET, []):
+                    if ipinfo.get('addr') and ipinfo.get('netmask'):
+                        yield ipinfo['addr'], ipinfo['netmask']
+            return
+
+        try:
+            import psutil
+        except ImportError:
+            pass
+        else:
+            for ipinfos in psutil.net_if_addrs().values():
+                for ipinfo in ipinfos:
+                    if ipinfo.family == socket.AF_INET and ipinfo.address and ipinfo.netmask:
+                        yield ipinfo.address, ipinfo.netmask
+            return
+
+        for ipinfo in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            yield ipinfo[4][0], '255.255.255.0'
+
     def get_subnets(self):
         """
         Look through the machine's internet connection and
@@ -431,18 +466,8 @@ class Drone(RobotBase):
                  list[str]: addr_list
         """
         subnets = []
-        ifaces = netifaces.interfaces()
         addr_list = []
-        for myiface in ifaces:
-            addrs = netifaces.ifaddresses(myiface)
-
-            if socket.AF_INET not in addrs:
-                continue
-            # Get ipv4 stuff
-            ipinfo = addrs[socket.AF_INET][0]
-            address = ipinfo['addr']
-            netmask = ipinfo['netmask']
-
+        for address, netmask in self._ipv4_interfaces():
             # limit range of search. This will work for router subnets
             if netmask != '255.255.255.0':
                 continue

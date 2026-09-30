@@ -261,6 +261,11 @@ class SdkConnection(BaseConnection):
                 if prot._retcode == 0:
                     if prot._state == 0:
                         logger.info("SdkConnection: accept connection.")
+                        # The robot took the address we asked for, so there is no
+                        # config ip to adopt: keep the requested one. Without this
+                        # return the function falls through to an implicit None,
+                        # which request_connection unpacks into a TypeError.
+                        return True, msg.get_proto()._ip
                     if prot._state == 1:
                         logger.error("SdkConnection: reject connection, service is busy!")
                         return False, None

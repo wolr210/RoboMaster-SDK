@@ -108,7 +108,7 @@ class LiveView(object):
         for frame_data in frames:
             (frame, width, height, ls) = frame_data
             if frame:
-                frame = numpy.fromstring(frame, dtype=numpy.ubyte, count=len(frame), sep='')
+                frame = numpy.frombuffer(frame, dtype=numpy.ubyte)
                 frame = (frame.reshape((height, width, 3)))
                 res_frame_list.append(frame)
         return res_frame_list

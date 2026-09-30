@@ -26,7 +26,7 @@ QRCODE_NAME = "qrcode.png"
 if __name__ == '__main__':
 
     helper = conn.ConnectionHelper()
-    info = helper.build_qrcode_string(ssid="RoboMaster_SDK_WIFI", password="12341234")
+    info = helper.build_qrcode_string(ssid="PRG_WIFI", password="prgwifi@123")
     myqr.run(words=info)
     time.sleep(1)
     img = Image.open(QRCODE_NAME)

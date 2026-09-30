@@ -6,16 +6,23 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libavutil/mem.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/samplefmt.h>
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 }
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdexcept>
 #include <string>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <utility>
-#include <opus/opus.h>
+#include <vector>
 #include <pybind11/pybind11.h>
 
 #ifndef PIX_FMT_BGR24
@@ -26,17 +33,37 @@ extern "C" {
 #define PIX_FMT_RGB24 AV_PIX_FMT_RGB24
 #endif
 
-#ifndef CODEC_CAP_TRUNCATED
+// The truncated-input flags were removed in FFmpeg 6.0.
+#if !defined(CODEC_CAP_TRUNCATED) && defined(AV_CODEC_CAP_TRUNCATED)
 #define CODEC_CAP_TRUNCATED AV_CODEC_CAP_TRUNCATED
 #endif
 
-#ifndef CODEC_FLAG_TRUNCATED
+#if !defined(CODEC_FLAG_TRUNCATED) && defined(AV_CODEC_FLAG_TRUNCATED)
 #define CODEC_FLAG_TRUNCATED AV_CODEC_FLAG_TRUNCATED
 #endif
 
 #if (LIBAVCODEC_VERSION_MAJOR <= 54)
 #  define av_frame_alloc avcodec_alloc_frame
 #  define av_frame_free  avcodec_free_frame
+#endif
+
+// FFmpeg 5.0 (libavcodec 59) made the decoder lookups return const pointers.
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+using AVCodecPtr = const AVCodec *;
+#else
+using AVCodecPtr = AVCodec *;
+#endif
+
+// FFmpeg 6.0 (libavutil 58) replaced AVFrame/AVCodecContext channels and
+// channel_layout with AVChannelLayout, and swr_alloc_set_opts() with
+// swr_alloc_set_opts2(); FFmpeg 7.0 removed the old spellings outright.
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+#define RM_HAVE_CH_LAYOUT 1
+#endif
+
+#ifdef _MSC_VER
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
 #endif
 
 using ubyte = unsigned char;
@@ -52,14 +79,14 @@ class H264Decoder {
 private:
     AVCodecContext        *context;
     AVFrame               *frame;
-    AVCodec               *codec;
+    AVCodecPtr             codec;
     AVCodecParserContext  *parser;
     AVPacket              *pkt;
 
 public:
     H264Decoder() {
-        avcodec_register_all();
-
+        // Codec registration became implicit in FFmpeg 4.0; the call was
+        // removed in 5.0.
         codec = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!codec)
             throw CodecException("H264Decoder: avcodec_find_decoder failed!");
@@ -68,9 +95,11 @@ public:
         if (!context)
             throw CodecException("H264Decoder: avcodec_alloc_context3 failed!");
 
-        if(codec->capabilities & CODEC_CAP_TRUNCATED) {
+#if defined(CODEC_CAP_TRUNCATED) && defined(CODEC_FLAG_TRUNCATED)
+        if (codec->capabilities & CODEC_CAP_TRUNCATED) {
             context->flags |= CODEC_FLAG_TRUNCATED;
         }
+#endif
 
         int err = avcodec_open2(context, codec, nullptr);
         if (err < 0)
@@ -84,18 +113,16 @@ public:
         if (!frame)
             throw CodecException("H264Decoder: av_frame_alloc failed!");
 
-        pkt = new AVPacket;
+        pkt = av_packet_alloc();
         if (!pkt)
-            throw CodecException("H264Decoder: alloc AVPacket failed!");
-        av_init_packet(pkt);
+            throw CodecException("H264Decoder: av_packet_alloc failed!");
     }
 
     ~H264Decoder() {
         av_parser_close(parser);
-        avcodec_close(context);
-        av_free(context);
+        avcodec_free_context(&context);
         av_frame_free(&frame);
-        delete pkt;
+        av_packet_free(&pkt);
     }
 
     ssize_t parse(const unsigned char* in_data, ssize_t in_size) {
@@ -110,10 +137,20 @@ public:
     }
 
     const AVFrame& decode_frame() {
-        int got_picture = 0;
-        int nread = avcodec_decode_video2(context, frame, &got_picture, pkt);
-        if (nread < 0 || got_picture == 0)
-            throw CodecException("H264Decoder: decode_frame, avcodec_decode_video2 failed!");
+        // avcodec_decode_video2() was removed in FFmpeg 5.0; send/receive is
+        // the equivalent and goes back to FFmpeg 3.1.
+        int sent = avcodec_send_packet(context, pkt);
+        if (sent < 0 && sent != AVERROR(EAGAIN))
+            throw CodecException("H264Decoder: decode_frame, avcodec_send_packet failed!");
+
+        int ret = avcodec_receive_frame(context, frame);
+        if (sent == AVERROR(EAGAIN)) {
+            // The decoder refused the packet until its output was drained, so
+            // hand it over now that a frame has been taken out.
+            avcodec_send_packet(context, pkt);
+        }
+        if (ret < 0)
+            throw CodecException("H264Decoder: decode_frame, avcodec_receive_frame failed!");
         return *frame;
     }
 };
@@ -140,7 +177,9 @@ public:
     }
 
     int predict_size(int w, int h) {
-        return avpicture_fill((AVPicture*)output_frame_, nullptr, output_format_, w, h);
+        // AVPicture and avpicture_fill() were removed in FFmpeg 5.0; align=1
+        // reproduces the tightly packed layout avpicture_fill() gave.
+        return av_image_get_buffer_size(output_format_, w, h, 1);
     }
 
     const AVFrame& convert(const AVFrame &frame, unsigned char* out_bgr) {
@@ -154,7 +193,8 @@ public:
         if (!context_)
             throw CodecException("FormatConverter: convert, sws_getCachedContext failed!");
 
-        avpicture_fill((AVPicture*)output_frame_, out_bgr, output_format_, w, h);
+        av_image_fill_arrays(output_frame_->data, output_frame_->linesize, out_bgr,
+                            output_format_, w, h, 1);
 
         sws_scale(context_, frame.data, frame.linesize, 0, h,
                   output_frame_->data, output_frame_->linesize);
@@ -226,7 +266,7 @@ public:
 
     ~PyH264Decoder() = default;
 
-    py::list decode(const py::str &input) {
+    py::list decode(const py::bytes &input) {
         ssize_t len = PYBIND11_BYTES_SIZE(input.ptr());
         const ubyte* data_in = (const ubyte*)(PYBIND11_BYTES_AS_STRING(input.ptr()));
 
@@ -255,58 +295,211 @@ public:
 };
 
 
+// The vendored opus-share package ships no MSVC import library (and no DLL), so
+// the Opus stream is decoded through libavcodec instead. Both the native "opus"
+// decoder and the "libopus" wrapper are handled; the output stays raw
+// little-endian interleaved s16, as the libopus version produced.
 class PyOpusDecoder {
 public:
     PyOpusDecoder(int frame_size, int sample_rate, int channels):
-            FRAME_SIZE(frame_size),SAMPLE_RATE(sample_rate),CHANNELS(channels) {
-        int err;
-        decoder_ = opus_decoder_create(SAMPLE_RATE, CHANNELS, &err);
-        if (err < 0) {
-            throw CodecException("PyOpusDecoder: opus_decoder_create failed!");
+            FRAME_SIZE(frame_size), SAMPLE_RATE(sample_rate), CHANNELS(channels) {
+        AVCodecPtr codec = avcodec_find_decoder_by_name("libopus");
+        if (!codec) {
+            codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
         }
-        int16_raw_ = new opus_int16[FRAME_SIZE];
+        if (!codec)
+            throw CodecException("PyOpusDecoder: libavcodec has no Opus decoder!");
+
+        context_ = avcodec_alloc_context3(codec);
+        if (!context_)
+            throw CodecException("PyOpusDecoder: avcodec_alloc_context3 failed!");
+
+        context_->sample_rate = SAMPLE_RATE;
+#ifdef RM_HAVE_CH_LAYOUT
+        av_channel_layout_uninit(&context_->ch_layout);
+        av_channel_layout_default(&context_->ch_layout, CHANNELS);
+#else
+        context_->channels = CHANNELS;
+        context_->channel_layout = channel_layout(CHANNELS);
+#endif
+        context_->request_sample_fmt = AV_SAMPLE_FMT_S16;
+        set_opus_head_extradata();
+
+        if (avcodec_open2(context_, codec, nullptr) < 0)
+            throw CodecException("PyOpusDecoder: avcodec_open2 failed!");
+
+        frame_ = av_frame_alloc();
+        if (!frame_)
+            throw CodecException("PyOpusDecoder: av_frame_alloc failed!");
+
+        pkt_ = av_packet_alloc();
+        if (!pkt_)
+            throw CodecException("PyOpusDecoder: av_packet_alloc failed!");
     }
 
     ~PyOpusDecoder() {
-        opus_decoder_destroy(decoder_);
-        delete [] int16_raw_;
+        if (swr_)
+            swr_free(&swr_);
+        if (pkt_)
+            av_packet_free(&pkt_);
+        if (frame_)
+            av_frame_free(&frame_);
+        if (context_)
+            avcodec_free_context(&context_);
     }
 
-    py::bytes decode(const py::str & input) {
-        ssize_t len = PYBIND11_BYTES_SIZE(input.ptr());
-        const unsigned char* data_in = (const unsigned char*)(PYBIND11_BYTES_AS_STRING(input.ptr()));
-        try {
+    py::bytes decode(const py::bytes &input) {
+        char *data_in = nullptr;
+        Py_ssize_t len = 0;
+        if (PyBytes_AsStringAndSize(input.ptr(), &data_in, &len) != 0)
+            throw py::error_already_set();
+
+        std::string out;
+        {
             py::gil_scoped_release decoder_release;
-            int frame_size = opus_decode(decoder_, data_in, len, int16_raw_, FRAME_SIZE, 0);
-            if (frame_size < 0) {
-                return py::bytes();
-            }
-
-            py::gil_scoped_acquire decoder_acquire;
-            py::object py_out_str = py::reinterpret_steal<py::object>(
-                    PYBIND11_BYTES_FROM_STRING_AND_SIZE(NULL, frame_size * sizeof(opus_int16)));
-            char *out_buffer = PYBIND11_BYTES_AS_STRING(py_out_str.ptr());
-            py::gil_scoped_release convert_release;
-
-            for (int i = 0; i < frame_size; ++i) {
-                out_buffer[i * 2] = int16_raw_[i] & 0xFF;
-                out_buffer[i * 2 + 1] = (int16_raw_[i] >> 8) & 0xFF;
-            }
-
-            py::gil_scoped_acquire convert_acquire;
-            return py_out_str;
+            out = decode_packet(reinterpret_cast<const unsigned char *>(data_in),
+                                static_cast<int>(len));
         }
-        catch (const CodecException &e) {
-            throw e;
-        }
+        return py::bytes(out);
     }
 
 private:
+#ifndef RM_HAVE_CH_LAYOUT
+    static int64_t channel_layout(int channels) {
+        int64_t layout = av_get_default_channel_layout(channels);
+        return layout ? layout : ((channels == 1) ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO);
+    }
+#endif
+
+    // libavcodec has no equivalent of opus_decoder_create(rate, channels), it
+    // takes the stream layout from an OpusHead header, so synthesize one.
+    void set_opus_head_extradata() {
+        const int head_size = 19;
+        unsigned char *extradata = static_cast<unsigned char *>(
+                av_mallocz(head_size + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (!extradata)
+            throw CodecException("PyOpusDecoder: extradata allocation failed!");
+
+        memcpy(extradata, "OpusHead", 8);
+        extradata[8] = 1;                                            // version
+        extradata[9] = static_cast<unsigned char>(CHANNELS);         // channel count
+        extradata[10] = 0;                                           // pre-skip, LE
+        extradata[11] = 0;
+        extradata[12] = static_cast<unsigned char>(SAMPLE_RATE & 0xFF);         // input rate, LE
+        extradata[13] = static_cast<unsigned char>((SAMPLE_RATE >> 8) & 0xFF);
+        extradata[14] = static_cast<unsigned char>((SAMPLE_RATE >> 16) & 0xFF);
+        extradata[15] = static_cast<unsigned char>((SAMPLE_RATE >> 24) & 0xFF);
+        extradata[16] = 0;                                           // output gain, LE
+        extradata[17] = 0;
+        extradata[18] = 0;                                           // channel mapping family
+
+        context_->extradata = extradata;
+        context_->extradata_size = head_size;
+    }
+
+    std::string decode_packet(const unsigned char *data_in, int len) {
+        std::string out;
+        if (len <= 0)
+            return out;
+
+        // libavcodec readers may over-read a packet, so keep the padding.
+        packet_buffer_.assign(data_in, data_in + len);
+        packet_buffer_.resize(len + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+
+        av_packet_unref(pkt_);
+        pkt_->data = packet_buffer_.data();
+        pkt_->size = len;
+        int sent = avcodec_send_packet(context_, pkt_);
+        pkt_->data = nullptr;
+        pkt_->size = 0;
+        if (sent < 0)
+            return out;
+
+        while (avcodec_receive_frame(context_, frame_) >= 0) {
+            append_s16(out, *frame_);
+            av_frame_unref(frame_);
+        }
+        return out;
+    }
+
+    void append_s16(std::string &out, const AVFrame &frame) {
+        if (frame.nb_samples <= 0)
+            return;
+
+#ifdef RM_HAVE_CH_LAYOUT
+        int in_channels = frame.ch_layout.nb_channels > 0 ? frame.ch_layout.nb_channels : CHANNELS;
+#else
+        int in_channels = frame.channels > 0 ? frame.channels : CHANNELS;
+#endif
+        int in_rate = frame.sample_rate > 0 ? frame.sample_rate : SAMPLE_RATE;
+        if (static_cast<AVSampleFormat>(frame.format) == AV_SAMPLE_FMT_S16
+                && in_channels == CHANNELS && in_rate == SAMPLE_RATE) {
+            out.append(reinterpret_cast<const char *>(frame.data[0]),
+                       static_cast<size_t>(frame.nb_samples) * CHANNELS * sizeof(int16_t));
+            return;
+        }
+
+        // The native decoder emits planar float, so convert to interleaved s16.
+        if (!swr_) {
+#ifdef RM_HAVE_CH_LAYOUT
+            // av_channel_layout_copy() uninits its destination first, so these
+            // must be zeroed rather than left as stack garbage.
+            AVChannelLayout out_layout = {};
+            AVChannelLayout in_layout = {};
+            av_channel_layout_default(&out_layout, CHANNELS);
+            if (frame.ch_layout.nb_channels > 0) {
+                av_channel_layout_copy(&in_layout, &frame.ch_layout);
+            } else {
+                av_channel_layout_default(&in_layout, in_channels);
+            }
+            int ret = swr_alloc_set_opts2(&swr_,
+                                          &out_layout, AV_SAMPLE_FMT_S16, SAMPLE_RATE,
+                                          &in_layout, static_cast<AVSampleFormat>(frame.format),
+                                          in_rate, 0, nullptr);
+            av_channel_layout_uninit(&in_layout);
+            av_channel_layout_uninit(&out_layout);
+            if (ret < 0 || !swr_ || swr_init(swr_) < 0) {
+                if (swr_)
+                    swr_free(&swr_);
+                throw CodecException("PyOpusDecoder: swr_alloc_set_opts2 failed!");
+            }
+#else
+            int64_t in_layout = frame.channel_layout ? static_cast<int64_t>(frame.channel_layout)
+                                                     : channel_layout(in_channels);
+            swr_ = swr_alloc_set_opts(nullptr,
+                                      channel_layout(CHANNELS), AV_SAMPLE_FMT_S16, SAMPLE_RATE,
+                                      in_layout, static_cast<AVSampleFormat>(frame.format), in_rate,
+                                      0, nullptr);
+            if (!swr_ || swr_init(swr_) < 0) {
+                if (swr_)
+                    swr_free(&swr_);
+                throw CodecException("PyOpusDecoder: swr_init failed!");
+            }
+#endif
+        }
+
+        int out_samples = swr_get_out_samples(swr_, frame.nb_samples);
+        if (out_samples <= 0)
+            return;
+        std::vector<unsigned char> buffer(
+                static_cast<size_t>(out_samples) * CHANNELS * sizeof(int16_t));
+        unsigned char *out_planes[1] = {buffer.data()};
+        int converted = swr_convert(swr_, out_planes, out_samples,
+                                    const_cast<const unsigned char **>(frame.data),
+                                    frame.nb_samples);
+        if (converted > 0)
+            out.append(reinterpret_cast<const char *>(buffer.data()),
+                       static_cast<size_t>(converted) * CHANNELS * sizeof(int16_t));
+    }
+
     int FRAME_SIZE = 960;
     int SAMPLE_RATE = 48000;
     int CHANNELS = 1;
-    OpusDecoder *decoder_;
-    opus_int16 *int16_raw_;
+    AVCodecContext *context_ = nullptr;
+    AVFrame *frame_ = nullptr;
+    AVPacket *pkt_ = nullptr;
+    SwrContext *swr_ = nullptr;
+    std::vector<unsigned char> packet_buffer_;
 };
 
 #endif

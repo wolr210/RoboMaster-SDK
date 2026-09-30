@@ -1,0 +1,2 @@
+# Enforce LF for shell scripts: bash on the Pi cannot run CRLF files.
+*.sh text eol=lf

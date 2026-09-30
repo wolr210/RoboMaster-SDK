@@ -42,8 +42,8 @@ class CMakeBuild(build_ext):
 
         if platform.system() == "Windows":
             cmake_version = LooseVersion(re.search(r'version\s*([\d.]+)', out.decode()).group(1))
-            if cmake_version < '3.1.0':
-                raise RuntimeError("CMake >= 3.1.0 is required on Windows")
+            if cmake_version < '3.5.0':
+                raise RuntimeError("CMake >= 3.5.0 is required on Windows")
 
         for ext in self.extensions:
             self.build_extension(ext)
@@ -55,6 +55,7 @@ class CMakeBuild(build_ext):
             extdir += os.path.sep
 
         cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
+                      '-DPython_EXECUTABLE=' + sys.executable,
                       '-DPYTHON_EXECUTABLE=' + sys.executable]
 
         cfg = 'Debug' if self.debug else 'Release'
@@ -78,15 +79,45 @@ class CMakeBuild(build_ext):
         subprocess.check_call(['cmake', '--build', '.'] + build_args, cwd=self.build_temp)
 
 
+FFMPEG_DLLS = ["avcodec-58.dll", "avutil-56.dll", "swresample-3.dll", "swscale-5.dll"]
+
+
+def find_ffmpeg_dlls():
+    """Locate the ffmpeg 4.2 runtime DLLs to ship next to the extension.
+
+    Python 3.8+ does not search PATH when resolving an extension module's
+    dependencies, so the DLLs have to sit in site-packages beside the .pyd
+    (or be registered with os.add_dll_directory() before the import).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if os.environ.get("FFMPEG_DLL_DIR"):
+        candidates.append(os.environ["FFMPEG_DLL_DIR"])
+    candidates.append(os.path.join(here, "src", "ffmpeg-dll"))
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if ffmpeg_exe:
+        candidates.append(os.path.dirname(os.path.abspath(ffmpeg_exe)))
+    candidates.append(os.path.join("C:", os.sep, "ffmpeg", "bin"))
+
+    for directory in candidates:
+        paths = [os.path.join(directory, name) for name in FFMPEG_DLLS]
+        if all(os.path.isfile(path) for path in paths):
+            print("libmedia_codec: bundling ffmpeg DLLs from {0}".format(directory))
+            return paths
+
+    print("libmedia_codec: WARNING, the ffmpeg runtime DLLs ({0}) were not found. Set "
+          "FFMPEG_DLL_DIR, or call os.add_dll_directory() on the ffmpeg bin directory "
+          "before importing libmedia_codec.".format(", ".join(FFMPEG_DLLS)))
+    return []
+
+
 data_files = []
 
 
 if platform.system() == "Windows":
-    data_files = [('lib\\site-packages\\', ["src\\ffmpeg-dll\\avcodec-58.dll"]), 
-                  ('lib\\site-packages\\', ["src\\ffmpeg-dll\\avutil-56.dll"]),
-                  ('lib\\site-packages\\', ["src\\ffmpeg-dll\\swresample-3.dll"]),
-                  ('lib\\site-packages\\', ["src\\ffmpeg-dll\\swscale-5.dll"]),
-                  ('lib\\site-packages\\', ["src\\opus-dll\\opus.dll"])]
+    ffmpeg_dlls = find_ffmpeg_dlls()
+    if ffmpeg_dlls:
+        data_files = [(os.path.join('lib', 'site-packages'), ffmpeg_dlls)]
 
 setup(
     name='libmedia_codec',

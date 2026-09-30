@@ -287,7 +287,7 @@ class SdkConnection(BaseConnection):
         local_addr = None
         remote_addr = None
         proto = protocol.ProtoSetSdkConnection()
-        if conn_type is CONNECTION_WIFI_AP:
+        if conn_type == CONNECTION_WIFI_AP:
             proto._connection = 0
             if config.LOCAL_IP_STR:
                 proto._ip = config.LOCAL_IP_STR
@@ -298,12 +298,12 @@ class SdkConnection(BaseConnection):
             proxy_addr = (config.ROBOT_DEFAULT_WIFI_ADDR[0], config.ROBOT_PROXY_PORT)
             remote_addr = config.ROBOT_DEFAULT_WIFI_ADDR
             local_addr = (proto._ip, proto._port)
-        elif conn_type is CONNECTION_WIFI_STA:
+        elif conn_type == CONNECTION_WIFI_STA:
             proto._connection = 1
             local_ip = '0.0.0.0'
             if config.LOCAL_IP_STR:
                 local_ip = config.LOCAL_IP_STR
-            proto.ip = local_ip
+            proto._ip = local_ip
             proto._port = random.randint(config.ROBOT_SDK_PORT_MIN, config.ROBOT_SDK_PORT_MAX)
             logger.info("SdkConnection: request_connection with ip:{0}, port:{1}".format(local_ip, proto._port))
             if config.ROBOT_IP_STR:
@@ -315,7 +315,7 @@ class SdkConnection(BaseConnection):
             local_addr = (local_ip, proto._port)
             remote_addr = (remote_ip, config.ROBOT_DEVICE_PORT)
             proxy_addr = (remote_ip, config.ROBOT_PROXY_PORT)
-        elif conn_type is CONNECTION_USB_RNDIS:
+        elif conn_type == CONNECTION_USB_RNDIS:
             proto._connection = 2
             proto._ip = config.ROBOT_DEFAULT_LOCAL_RNDIS_ADDR[0]
             proto._port = random.randint(config.ROBOT_SDK_PORT_MIN,
